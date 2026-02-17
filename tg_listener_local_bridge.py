@@ -1,6 +1,6 @@
 import os, re, json, time, asyncio
 from collections import deque
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -64,15 +64,31 @@ def enqueue_signal(payload: Dict[str, Any]) -> None:
     PENDING_QUEUE.append(payload)
 
 
+def _to_int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def remove_acked_signal(chat_id: Any, message_id: Any, key: Any) -> bool:
     if not PENDING_QUEUE:
         return False
 
+    normalized_key = str(key).strip() if key is not None else ""
+    normalized_chat_id = _to_int_or_none(chat_id)
+    normalized_message_id = _to_int_or_none(message_id)
+
     for i, item in enumerate(PENDING_QUEUE):
-        if key and key == item.get("key"):
+        if normalized_key and normalized_key == str(item.get("key") or ""):
             del PENDING_QUEUE[i]
             return True
-        if chat_id == item.get("chat_id") and message_id == item.get("message_id"):
+
+        item_chat_id = _to_int_or_none(item.get("chat_id"))
+        item_message_id = _to_int_or_none(item.get("message_id"))
+        if normalized_chat_id == item_chat_id and normalized_message_id == item_message_id:
             del PENDING_QUEUE[i]
             return True
 
@@ -184,6 +200,15 @@ async def run_telethon():
     log("🔐 Al primo avvio: telefono + codice Telegram (login).")
 
     client = TelegramClient("unred_session", API_ID, API_HASH)
+
+    # Necessario al primo avvio: apre prompt telefono/codice nel terminale.
+    # Senza start() la sessione può restare non autorizzata e non ricevere messaggi.
+    await client.start()
+    if not await client.is_user_authorized():
+        raise SystemExit("Telegram login non completato: riprova e inserisci telefono/codice nel terminale.")
+
+    me = await client.get_me()
+    log(f"Telegram login OK: @{(me.username or '').strip() or me.id}")
 
     @client.on(events.NewMessage)
     async def on_new_message(event):
