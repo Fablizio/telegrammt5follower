@@ -153,7 +153,49 @@ async def latest_handler(request: web.Request):
     return cors(web.json_response(payload_from_queue()))
 
 async def health_handler(request: web.Request):
-    return cors(web.json_response({"ok": True, "allowed": sorted(ALLOWED_CHAT_IDS)}))
+    return cors(web.json_response({
+        "ok": True,
+        "allowed": sorted(ALLOWED_CHAT_IDS),
+        "pending": len(PENDING_QUEUE),
+    }))
+
+async def debug_enqueue_handler(request: web.Request):
+    """
+    Endpoint locale per verificare facilmente il flusso verso lo script consumer.
+    Abilitato solo se DEBUG_ENQUEUE=1.
+    """
+    if os.getenv("DEBUG_ENQUEUE", "0") != "1":
+        return cors(web.json_response({"ok": False, "err": "disabled"}, status=403))
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    text = normalize_telegram_signal(str(data.get("text") or "").strip())
+    if not text:
+        return cors(web.json_response({"ok": False, "err": "missing_text"}, status=400))
+
+    chat_id = _to_int_or_none(data.get("chat_id")) or 0
+    message_id = _to_int_or_none(data.get("message_id")) or int(time.time())
+
+    payload = {
+        "ts": int(time.time() * 1000),
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "key": f"{chat_id}:{message_id}",
+        "text": text,
+    }
+    enqueue_signal(payload)
+
+    LATEST["ok"] = True
+    LATEST["ts"] = payload["ts"]
+    LATEST["chat_id"] = payload["chat_id"]
+    LATEST["message_id"] = payload["message_id"]
+    LATEST["key"] = payload["key"]
+    LATEST["text"] = payload["text"]
+
+    return cors(web.json_response({"ok": True, "queued": payload, "pending": len(PENDING_QUEUE)}))
 
 async def ack_handler(request: web.Request):
     """
@@ -177,10 +219,12 @@ async def run_http():
     app.router.add_route("OPTIONS", "/latest", options_handler)
     app.router.add_route("OPTIONS", "/health", options_handler)
     app.router.add_route("OPTIONS", "/ack", options_handler)
+    app.router.add_route("OPTIONS", "/debug/enqueue", options_handler)
 
     app.router.add_get("/latest", latest_handler)
     app.router.add_get("/health", health_handler)
     app.router.add_post("/ack", ack_handler)
+    app.router.add_post("/debug/enqueue", debug_enqueue_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
