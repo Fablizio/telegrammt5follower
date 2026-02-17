@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors.common import TypeNotFoundError
 from aiohttp import web
 
 load_dotenv()
@@ -250,59 +251,77 @@ async def run_telethon():
     log(f"Telethon starting. Whitelist chatIds: {sorted(ALLOWED_CHAT_IDS)}")
     log("🔐 Al primo avvio: telefono + codice Telegram (login).")
 
-    client = TelegramClient("unred_session", API_ID, API_HASH)
+    reconnect_attempt = 0
+    while True:
+        client = TelegramClient("unred_session", API_ID, API_HASH)
+        try:
+            # Necessario al primo avvio: apre prompt telefono/codice nel terminale.
+            # Senza start() la sessione può restare non autorizzata e non ricevere messaggi.
+            await client.start()
+            if not await client.is_user_authorized():
+                raise SystemExit("Telegram login non completato: riprova e inserisci telefono/codice nel terminale.")
 
-    # Necessario al primo avvio: apre prompt telefono/codice nel terminale.
-    # Senza start() la sessione può restare non autorizzata e non ricevere messaggi.
-    await client.start()
-    if not await client.is_user_authorized():
-        raise SystemExit("Telegram login non completato: riprova e inserisci telefono/codice nel terminale.")
+            me = await client.get_me()
+            log(f"Telegram login OK: @{(me.username or '').strip() or me.id}")
 
-    me = await client.get_me()
-    log(f"Telegram login OK: @{(me.username or '').strip() or me.id}")
+            @client.on(events.NewMessage)
+            async def on_new_message(event):
+                chat_id = event.chat_id
+                if chat_id not in ALLOWED_CHAT_IDS:
+                    return
 
-    @client.on(events.NewMessage)
-    async def on_new_message(event):
-        chat_id = event.chat_id
-        if chat_id not in ALLOWED_CHAT_IDS:
-            return
+                msg_id = event.message.id
+                key_state = str(chat_id)
+                last_id = int(state.get(key_state, 0))
+                if msg_id <= last_id:
+                    return
 
-        msg_id = event.message.id
-        key_state = str(chat_id)
-        last_id = int(state.get(key_state, 0))
-        if msg_id <= last_id:
-            return
+                raw = event.raw_text or ""
+                normalized = normalize_telegram_signal(raw)
 
-        raw = event.raw_text or ""
-        normalized = normalize_telegram_signal(raw)
+                # aggiorno lo state anche su messaggi non validi, così non rileggo
+                state[key_state] = msg_id
+                save_state(state)
 
-        # aggiorno lo state anche su messaggi non validi, così non rileggo
-        state[key_state] = msg_id
-        save_state(state)
+                if not normalized or not looks_like_signal(normalized):
+                    return
 
-        if not normalized or not looks_like_signal(normalized):
-            return
+                payload = {
+                    "ts": int(time.time() * 1000),
+                    "chat_id": chat_id,
+                    "message_id": msg_id,
+                    "key": f"{chat_id}:{msg_id}",
+                    "text": normalized,
+                }
+                enqueue_signal(payload)
 
-        payload = {
-            "ts": int(time.time() * 1000),
-            "chat_id": chat_id,
-            "message_id": msg_id,
-            "key": f"{chat_id}:{msg_id}",
-            "text": normalized,
-        }
-        enqueue_signal(payload)
+                LATEST["ok"] = True
+                LATEST["ts"] = payload["ts"]
+                LATEST["chat_id"] = payload["chat_id"]
+                LATEST["message_id"] = payload["message_id"]
+                LATEST["key"] = payload["key"]
+                LATEST["text"] = payload["text"]
 
-        LATEST["ok"] = True
-        LATEST["ts"] = payload["ts"]
-        LATEST["chat_id"] = payload["chat_id"]
-        LATEST["message_id"] = payload["message_id"]
-        LATEST["key"] = payload["key"]
-        LATEST["text"] = payload["text"]
+                log(f"NEW SIGNAL chat={chat_id} msg={msg_id} pending={len(PENDING_QUEUE)}\n{normalized}\n---")
 
-        log(f"NEW SIGNAL chat={chat_id} msg={msg_id} pending={len(PENDING_QUEUE)}\n{normalized}\n---")
+            async with client:
+                await client.run_until_disconnected()
 
-    async with client:
-        await client.run_until_disconnected()
+            reconnect_attempt = 0
+            break
+        except TypeNotFoundError as exc:
+            reconnect_attempt += 1
+            wait_seconds = min(60, reconnect_attempt * 5)
+            log(
+                "Telethon ha ricevuto un pacchetto non decodificabile "
+                f"({exc}). Possibile sessione usata da più client/versioni. "
+                f"Riprovo tra {wait_seconds}s (tentativo {reconnect_attempt})."
+            )
+            await client.disconnect()
+            await asyncio.sleep(wait_seconds)
+        except Exception:
+            await client.disconnect()
+            raise
 
 async def main():
     await run_http()
