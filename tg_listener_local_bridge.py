@@ -1,4 +1,5 @@
 import os, re, json, time, asyncio
+from collections import deque
 from typing import Dict, Any
 
 from dotenv import load_dotenv
@@ -27,6 +28,55 @@ LATEST: Dict[str, Any] = {
     "key": "",
     "text": "",
 }
+
+PENDING_QUEUE = deque(maxlen=200)
+
+
+def empty_payload() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "ts": 0,
+        "chat_id": None,
+        "message_id": 0,
+        "key": "",
+        "text": "",
+    }
+
+
+def payload_from_queue() -> Dict[str, Any]:
+    if not PENDING_QUEUE:
+        return empty_payload()
+    return {"ok": True, **PENDING_QUEUE[0]}
+
+
+def enqueue_signal(payload: Dict[str, Any]) -> None:
+    key = payload.get("key")
+    if not key:
+        return
+
+    if any(x.get("key") == key for x in PENDING_QUEUE):
+        return
+
+    if len(PENDING_QUEUE) == PENDING_QUEUE.maxlen:
+        dropped = PENDING_QUEUE.popleft()
+        log(f"Queue piena: rimosso il più vecchio {dropped.get('key')}")
+
+    PENDING_QUEUE.append(payload)
+
+
+def remove_acked_signal(chat_id: Any, message_id: Any, key: Any) -> bool:
+    if not PENDING_QUEUE:
+        return False
+
+    for i, item in enumerate(PENDING_QUEUE):
+        if key and key == item.get("key"):
+            del PENDING_QUEUE[i]
+            return True
+        if chat_id == item.get("chat_id") and message_id == item.get("message_id"):
+            del PENDING_QUEUE[i]
+            return True
+
+    return False
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -84,7 +134,7 @@ async def options_handler(request: web.Request):
 
 # ---------- HTTP server (localhost) ----------
 async def latest_handler(request: web.Request):
-    return cors(web.json_response(LATEST))
+    return cors(web.json_response(payload_from_queue()))
 
 async def health_handler(request: web.Request):
     return cors(web.json_response({"ok": True, "allowed": sorted(ALLOWED_CHAT_IDS)}))
@@ -103,18 +153,8 @@ async def ack_handler(request: web.Request):
     message_id = data.get("message_id")
     key = data.get("key")
 
-    if key and key == LATEST.get("key"):
-        LATEST["ok"] = False
-        LATEST["text"] = ""
-        return cors(web.json_response({"ok": True, "cleared": True}))
-
-    if chat_id == LATEST.get("chat_id") and message_id == LATEST.get("message_id"):
-        LATEST["ok"] = False
-        LATEST["text"] = ""
-        LATEST["key"] = ""
-        return cors(web.json_response({"ok": True, "cleared": True}))
-
-    return cors(web.json_response({"ok": True, "cleared": False}))
+    cleared = remove_acked_signal(chat_id=chat_id, message_id=message_id, key=key)
+    return cors(web.json_response({"ok": True, "cleared": cleared, "pending": len(PENDING_QUEUE)}))
 
 async def run_http():
     app = web.Application()
@@ -167,14 +207,23 @@ async def run_telethon():
         if not normalized or not looks_like_signal(normalized):
             return
 
-        LATEST["ok"] = True
-        LATEST["ts"] = int(time.time() * 1000)
-        LATEST["chat_id"] = chat_id
-        LATEST["message_id"] = msg_id
-        LATEST["key"] = f"{chat_id}:{msg_id}"
-        LATEST["text"] = normalized
+        payload = {
+            "ts": int(time.time() * 1000),
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "key": f"{chat_id}:{msg_id}",
+            "text": normalized,
+        }
+        enqueue_signal(payload)
 
-        log(f"NEW SIGNAL chat={chat_id} msg={msg_id}\n{normalized}\n---")
+        LATEST["ok"] = True
+        LATEST["ts"] = payload["ts"]
+        LATEST["chat_id"] = payload["chat_id"]
+        LATEST["message_id"] = payload["message_id"]
+        LATEST["key"] = payload["key"]
+        LATEST["text"] = payload["text"]
+
+        log(f"NEW SIGNAL chat={chat_id} msg={msg_id} pending={len(PENDING_QUEUE)}\n{normalized}\n---")
 
     async with client:
         await client.run_until_disconnected()
