@@ -135,7 +135,14 @@ def normalize_telegram_signal(text: str) -> str:
 
 def looks_like_signal(text: str) -> bool:
     t = (text or "").lower()
-    return ("entry" in t) and (("stop" in t) or ("sl" in t)) and ("tp" in t) and (("buy" in t) or ("sell" in t))
+    compact = re.sub(r"\s+", " ", t)
+
+    has_direction = re.search(r"\b(buy|sell)\b", compact) is not None
+    has_entry = re.search(r"\b(entry|entry\s*price|e)\s*[:=]", compact) is not None
+    has_tp = re.search(r"\b(tp|take\s*profit)\s*[:=]", compact) is not None
+    has_sl = re.search(r"\b(sl|stop\s*loss|stop|si)\s*[:=]", compact) is not None
+
+    return has_direction and has_entry and has_tp and has_sl
 
 # ---------- CORS / Helpers ----------
 def cors(resp: web.Response) -> web.Response:
