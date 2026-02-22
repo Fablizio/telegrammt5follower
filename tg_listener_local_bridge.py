@@ -1,122 +1,109 @@
-import os, re, json, time, asyncio
-from collections import deque
-from typing import Dict, Any, Optional
+import os
+import re
+import json
+import time
+import asyncio
+import atexit
+import tempfile
+from typing import Dict, Any
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors.common import TypeNotFoundError
-from aiohttp import web
+import aiohttp
+
+try:
+    import msvcrt
+except Exception:  # pragma: no cover - non-Windows
+    msvcrt = None
 
 load_dotenv()
 
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = (os.getenv("TG_API_HASH") or "").strip()
-
-ALLOWED_CHAT_IDS = set()
-for x in (os.getenv("ALLOWED_CHAT_IDS", "") or "").split(","):
-    x = x.strip()
-    if not x:
-        continue
-    ALLOWED_CHAT_IDS.add(int(x))
-
-STATE_FILE = "unred_state.json"
-
-LATEST: Dict[str, Any] = {
-    "ok": False,
-    "ts": 0,
-    "chat_id": None,
-    "message_id": 0,
-    "key": "",
-    "text": "",
+ALLOWED_CHAT_IDS = {
+    int(x.strip())
+    for x in (os.getenv("ALLOWED_CHAT_IDS", "") or "").split(",")
+    if x.strip()
+}
+CHAT_MASTER_MAP = {
+    -1003349817033: "master_2",
+    -1001467736193: "master_3",
 }
 
-PENDING_QUEUE = deque(maxlen=200)
+APP_PIN = (os.getenv("SIGNALCONVERTER_PIN") or os.getenv("APP_PIN") or "").strip() or "5487"
+SIGNALCONVERTER_LOGIN_URL = os.getenv(
+    "SIGNALCONVERTER_LOGIN_URL",
+    "https://www.unred.it/signalconverter/api/login",
+)
+SIGNALCONVERTER_URL = os.getenv(
+    "SIGNALCONVERTER_URL",
+    "https://www.unred.it/signalconverter/api/convert-send",
+)
+TOKEN_TTL = int(os.getenv("SIGNALCONVERTER_TOKEN_TTL", "540"))  # seconds
+
+STATE_FILE = "unred_state.json"
+SESSION_NAME = "unred_local_bridge"
+
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "unred_local_bridge.lock")
+_LOCK_HANDLE = None
+_converter_token: str = ""
+_token_ts: float = 0.0
 
 
-def empty_payload() -> Dict[str, Any]:
-    return {
-        "ok": False,
-        "ts": 0,
-        "chat_id": None,
-        "message_id": 0,
-        "key": "",
-        "text": "",
-    }
-
-
-def payload_from_queue() -> Dict[str, Any]:
-    if not PENDING_QUEUE:
-        return empty_payload()
-    return {"ok": True, **PENDING_QUEUE[0]}
-
-
-def enqueue_signal(payload: Dict[str, Any]) -> None:
-    key = payload.get("key")
-    if not key:
+def acquire_single_instance() -> None:
+    global _LOCK_HANDLE
+    if os.name != "nt" or msvcrt is None:
         return
-
-    if any(x.get("key") == key for x in PENDING_QUEUE):
-        return
-
-    if len(PENDING_QUEUE) == PENDING_QUEUE.maxlen:
-        dropped = PENDING_QUEUE.popleft()
-        log(f"Queue piena: rimosso il più vecchio {dropped.get('key')}")
-
-    PENDING_QUEUE.append(payload)
-
-
-def _to_int_or_none(value: Any) -> Optional[int]:
     try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+        _LOCK_HANDLE = open(LOCK_FILE, "a+")
+        _LOCK_HANDLE.seek(0)
+        msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_NBLCK, 1)
+    except Exception:
+        log("Another tg_listener_local_bridge instance is already running. Exit.")
+        raise SystemExit(0)
+
+    def _release_lock() -> None:
+        global _LOCK_HANDLE
+        try:
+            if _LOCK_HANDLE:
+                _LOCK_HANDLE.seek(0)
+                msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+                _LOCK_HANDLE.close()
+        except Exception:
+            pass
+        finally:
+            _LOCK_HANDLE = None
+
+    atexit.register(_release_lock)
 
 
-def remove_acked_signal(chat_id: Any, message_id: Any, key: Any) -> bool:
-    if not PENDING_QUEUE:
-        return False
-
-    normalized_key = str(key).strip() if key is not None else ""
-    normalized_chat_id = _to_int_or_none(chat_id)
-    normalized_message_id = _to_int_or_none(message_id)
-
-    for i, item in enumerate(PENDING_QUEUE):
-        if normalized_key and normalized_key == str(item.get("key") or ""):
-            del PENDING_QUEUE[i]
-            return True
-
-        item_chat_id = _to_int_or_none(item.get("chat_id"))
-        item_message_id = _to_int_or_none(item.get("message_id"))
-        if normalized_chat_id == item_chat_id and normalized_message_id == item_message_id:
-            del PENDING_QUEUE[i]
-            return True
-
-    return False
-
-def log(msg: str):
+def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
 
 def load_state() -> Dict[str, int]:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return {str(k): int(v) for k, v in d.items()}
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return {str(k): int(v) for k, v in raw.items()}
     except Exception:
         return {}
 
+
 def save_state(state: Dict[str, int]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    with open(STATE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+
 
 def clean_text(text: str) -> str:
     t = (text or "").replace("\u00A0", " ")
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
 
 def normalize_telegram_signal(text: str) -> str:
     lines = [ln.rstrip() for ln in clean_text(text).split("\n")]
@@ -125,7 +112,7 @@ def normalize_telegram_signal(text: str) -> str:
 
     while lines:
         last = lines[-1].strip()
-        if re.fullmatch(r"\d+", last) or re.fullmatch(r"\d{1,2}:\d{2}", last) or re.fullmatch(r"👁?\s*\d+", last):
+        if re.fullmatch(r"\d+", last) or re.fullmatch(r"\d{1,2}:\d{2}", last):
             lines.pop()
             while lines and lines[-1].strip() == "":
                 lines.pop()
@@ -134,114 +121,108 @@ def normalize_telegram_signal(text: str) -> str:
 
     return "\n".join(lines).strip()
 
+
+def normalize_for_converter(text: str) -> str:
+    t = text
+    t = re.sub(r"(?im)^\s*sell\s+limit\s*$", "Sell", t)
+    t = re.sub(r"(?im)^\s*buy\s+limit\s*$", "Buy", t)
+    t = re.sub(r"(?im)^\s*sell!+\s*$", "Sell", t)
+    t = re.sub(r"(?im)^\s*buy!+\s*$", "Buy", t)
+
+    t = re.sub(r"(?im)^\s*(entry|entry\s*price|e)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"Entry: \2", t)
+    t = re.sub(r"(?im)^\s*(tp|take\s*profit)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"TP: \2", t)
+    t = re.sub(r"(?im)^\s*(sl|stop\s*loss|stop|si)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"SL: \2", t)
+
+    return t.strip()
+
+
 def looks_like_signal(text: str) -> bool:
     t = (text or "").lower()
-    compact = re.sub(r"\s+", " ", t)
+    compact = re.sub(r"\s+", " ", t).strip()
 
-    has_direction = re.search(r"\b(buy|sell)\b", compact) is not None
-    has_entry = re.search(r"\b(entry|entry\s*price|e)\s*[:=]", compact) is not None
-    has_tp = re.search(r"\b(tp|take\s*profit)\s*[:=]", compact) is not None
-    has_sl = re.search(r"\b(sl|stop\s*loss|stop|si)\s*[:=]", compact) is not None
+    has_direction = re.search(r"\b(buy|sell)(?:\s+limit)?\b", compact) is not None
+    has_entry = re.search(r"\b(entry|entry\s*price|e)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
+    has_tp = re.search(r"\b(tp|take\s*profit)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
+    has_sl = re.search(r"\b(sl|stop\s*loss|stop|si)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
 
     return has_direction and has_entry and has_tp and has_sl
 
-# ---------- CORS / Helpers ----------
-def cors(resp: web.Response) -> web.Response:
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
 
-async def options_handler(request: web.Request):
-    return cors(web.Response(status=204))
-
-# ---------- HTTP server (localhost) ----------
-async def latest_handler(request: web.Request):
-    return cors(web.json_response(payload_from_queue()))
-
-async def health_handler(request: web.Request):
-    return cors(web.json_response({
-        "ok": True,
-        "allowed": sorted(ALLOWED_CHAT_IDS),
-        "pending": len(PENDING_QUEUE),
-    }))
-
-async def debug_enqueue_handler(request: web.Request):
-    """
-    Endpoint locale per verificare facilmente il flusso verso lo script consumer.
-    Abilitato solo se DEBUG_ENQUEUE=1.
-    """
-    if os.getenv("DEBUG_ENQUEUE", "0") != "1":
-        return cors(web.json_response({"ok": False, "err": "disabled"}, status=403))
+async def ensure_converter_token(session: aiohttp.ClientSession, force: bool = False) -> str:
+    global _converter_token, _token_ts
+    if not force and _converter_token and (time.time() - _token_ts) < TOKEN_TTL:
+        return _converter_token
+    if not APP_PIN:
+        log("[WARN] APP_PIN non impostato: impossibile autenticarsi")
+        return ""
 
     try:
-        data = await request.json()
-    except Exception:
-        data = {}
+        async with session.post(
+            SIGNALCONVERTER_LOGIN_URL,
+            json={"pin": APP_PIN},
+            timeout=15,
+        ) as resp:
+            if resp.status != 200:
+                log(f"[WARN] login converter HTTP {resp.status}")
+                return ""
+            data = await resp.json()
+    except Exception as exc:
+        log(f"[WARN] login converter errore: {exc}")
+        return ""
 
-    text = normalize_telegram_signal(str(data.get("text") or "").strip())
-    if not text:
-        return cors(web.json_response({"ok": False, "err": "missing_text"}, status=400))
+    token = data.get("token")
+    if not token:
+        log(f"[WARN] login converter risposta senza token: {data}")
+        return ""
 
-    chat_id = _to_int_or_none(data.get("chat_id")) or 0
-    message_id = _to_int_or_none(data.get("message_id")) or int(time.time())
+    _converter_token = token
+    _token_ts = time.time()
+    return token
 
-    payload = {
-        "ts": int(time.time() * 1000),
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "key": f"{chat_id}:{message_id}",
-        "text": text,
-    }
-    enqueue_signal(payload)
 
-    LATEST["ok"] = True
-    LATEST["ts"] = payload["ts"]
-    LATEST["chat_id"] = payload["chat_id"]
-    LATEST["message_id"] = payload["message_id"]
-    LATEST["key"] = payload["key"]
-    LATEST["text"] = payload["text"]
+async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, Any]) -> bool:
+    token = await ensure_converter_token(session)
+    if not token:
+        return False
 
-    return cors(web.json_response({"ok": True, "queued": payload, "pending": len(PENDING_QUEUE)}))
+    async def _post(current_token: str) -> aiohttp.ClientResponse:
+        return await session.post(
+            SIGNALCONVERTER_URL,
+            json={
+                "token": current_token,
+                "text": payload.get("text"),
+                "room": payload.get("master_hint"),
+            },
+            timeout=30,
+        )
 
-async def ack_handler(request: web.Request):
-    """
-    Il browser chiama /ack dopo aver cliccato "Converti & Invia".
-    Se (chat_id,message_id) matchano LATEST, svuotiamo LATEST per evitare resend.
-    """
     try:
-        data = await request.json()
-    except Exception:
-        return cors(web.json_response({"ok": False, "err": "bad_json"}, status=400))
+        resp = await _post(token)
+        if resp.status == 200:
+            data = await resp.json()
+            if data.get("ok"):
+                return True
+            log(f"[WARN] converter risposta non ok: {data}")
+        elif resp.status in (401, 403):
+            log("[INFO] token scaduto, rinnovo")
+            token = await ensure_converter_token(session, force=True)
+            if not token:
+                return False
+            resp = await _post(token)
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("ok"):
+                    return True
+                log(f"[WARN] converter risposta non ok (retry): {data}")
+        else:
+            text = await resp.text()
+            log(f"[WARN] converter HTTP {resp.status}: {text}")
+    except Exception as exc:
+        log(f"[WARN] converter errore: {exc}")
+    return False
 
-    chat_id = data.get("chat_id")
-    message_id = data.get("message_id")
-    key = data.get("key")
 
-    cleared = remove_acked_signal(chat_id=chat_id, message_id=message_id, key=key)
-    return cors(web.json_response({"ok": True, "cleared": cleared, "pending": len(PENDING_QUEUE)}))
-
-async def run_http():
-    app = web.Application()
-    app.router.add_route("OPTIONS", "/latest", options_handler)
-    app.router.add_route("OPTIONS", "/health", options_handler)
-    app.router.add_route("OPTIONS", "/ack", options_handler)
-    app.router.add_route("OPTIONS", "/debug/enqueue", options_handler)
-
-    app.router.add_get("/latest", latest_handler)
-    app.router.add_get("/health", health_handler)
-    app.router.add_post("/ack", ack_handler)
-    app.router.add_post("/debug/enqueue", debug_enqueue_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 8788)
-    await site.start()
-    log("HTTP bridge up: http://127.0.0.1:8788/latest")
-
-# ---------- Telethon ----------
-async def run_telethon():
+async def run_telethon_forever() -> None:
     if API_ID == 0 or not API_HASH:
         raise SystemExit("Missing TG_API_ID / TG_API_HASH in .env")
     if not ALLOWED_CHAT_IDS:
@@ -249,83 +230,85 @@ async def run_telethon():
 
     state = load_state()
     log(f"Telethon starting. Whitelist chatIds: {sorted(ALLOWED_CHAT_IDS)}")
-    log("🔐 Al primo avvio: telefono + codice Telegram (login).")
+    log("Login Telegram: se richiesto inserisci codice sul telefono.")
+    log(f"Session file: {SESSION_NAME}.session")
 
-    reconnect_attempt = 0
+    backoff = 5
     while True:
-        client = TelegramClient("unred_session", API_ID, API_HASH)
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        session_http = aiohttp.ClientSession()
         try:
-            # Necessario al primo avvio: apre prompt telefono/codice nel terminale.
-            # Senza start() la sessione può restare non autorizzata e non ricevere messaggi.
             await client.start()
-            if not await client.is_user_authorized():
-                raise SystemExit("Telegram login non completato: riprova e inserisci telefono/codice nel terminale.")
-
             me = await client.get_me()
             log(f"Telegram login OK: @{(me.username or '').strip() or me.id}")
 
             @client.on(events.NewMessage)
             async def on_new_message(event):
-                chat_id = event.chat_id
-                if chat_id not in ALLOWED_CHAT_IDS:
-                    return
+                try:
+                    chat_id = event.chat_id
+                    if chat_id not in ALLOWED_CHAT_IDS:
+                        return
 
-                msg_id = event.message.id
-                key_state = str(chat_id)
-                last_id = int(state.get(key_state, 0))
-                if msg_id <= last_id:
-                    return
+                    master_hint = CHAT_MASTER_MAP.get(int(chat_id))
+                    if not master_hint:
+                        return
 
-                raw = event.raw_text or ""
-                normalized = normalize_telegram_signal(raw)
+                    msg_id = event.message.id
+                    key_state = str(chat_id)
+                    last_id = int(state.get(key_state, 0))
+                    if msg_id <= last_id:
+                        return
 
-                # aggiorno lo state anche su messaggi non validi, così non rileggo
-                state[key_state] = msg_id
-                save_state(state)
+                    raw = event.raw_text or ""
+                    normalized = normalize_telegram_signal(raw)
+                    if not normalized or not looks_like_signal(normalized):
+                        return
 
-                if not normalized or not looks_like_signal(normalized):
-                    return
+                    normalized = normalize_for_converter(normalized)
+                    normalized = re.sub(r"(?im)^\s*Master\s*:\s*master_\d+\s*$\n?", "", normalized).strip()
+                    normalized = f"Master : {master_hint}\n" + normalized
 
-                payload = {
-                    "ts": int(time.time() * 1000),
-                    "chat_id": chat_id,
-                    "message_id": msg_id,
-                    "key": f"{chat_id}:{msg_id}",
-                    "text": normalized,
-                }
-                enqueue_signal(payload)
+                    payload = {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "master_hint": master_hint,
+                        "text": normalized,
+                    }
 
-                LATEST["ok"] = True
-                LATEST["ts"] = payload["ts"]
-                LATEST["chat_id"] = payload["chat_id"]
-                LATEST["message_id"] = payload["message_id"]
-                LATEST["key"] = payload["key"]
-                LATEST["text"] = payload["text"]
+                    if await send_to_converter(session_http, payload):
+                        state[key_state] = msg_id
+                        save_state(state)
+                        log(f"SENT chat={chat_id} msg={msg_id}\n{normalized}\n---")
+                    else:
+                        log(f"[WARN] invio fallito chat={chat_id} msg={msg_id}")
 
-                log(f"NEW SIGNAL chat={chat_id} msg={msg_id} pending={len(PENDING_QUEUE)}\n{normalized}\n---")
+                except Exception as exc:
+                    log(f"handler error: {exc}")
 
             async with client:
                 await client.run_until_disconnected()
 
-            reconnect_attempt = 0
-            break
+            backoff = 5
         except TypeNotFoundError as exc:
-            reconnect_attempt += 1
-            wait_seconds = min(60, reconnect_attempt * 5)
-            log(
-                "Telethon ha ricevuto un pacchetto non decodificabile "
-                f"({exc}). Possibile sessione usata da più client/versioni. "
-                f"Riprovo tra {wait_seconds}s (tentativo {reconnect_attempt})."
-            )
-            await client.disconnect()
-            await asyncio.sleep(wait_seconds)
-        except Exception:
-            await client.disconnect()
-            raise
+            log(f"TypeNotFoundError: {exc}")
+            backoff = min(60, backoff * 2)
+            await asyncio.sleep(backoff)
+        except Exception as exc:
+            log(f"Telethon fatal: {exc}")
+            backoff = min(60, backoff * 2)
+            await asyncio.sleep(backoff)
+        finally:
+            await session_http.close()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
-async def main():
-    await run_http()
-    await run_telethon()
+
+def main() -> None:
+    asyncio.run(run_telethon_forever())
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    acquire_single_instance()
+    main()

@@ -1,1 +1,60 @@
-/venv
+# =========================
+# 🔐 Environment variables
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# 🐍 Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# 📦 Build / Distribution
+# =========================
+build/
+dist/
+*.spec
+
+# PyInstaller
+*.manifest
+*.exe
+
+# =========================
+# 📡 Telegram / Telethon
+# =========================
+*.session
+*.session-journal
+
+# =========================
+# 📊 Runtime state files
+# =========================
+*_state.json
+unred_state.json
+
+# =========================
+# 📝 Logs
+# =========================
+*.log
+
+# =========================
+# 🖥️ Windows
+# =========================
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
