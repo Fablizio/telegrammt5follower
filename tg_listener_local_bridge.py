@@ -30,6 +30,10 @@ CHAT_MASTER_MAP = {
     -1003349817033: "master_2",
     -1001467736193: "master_3",
 }
+CHAT_ROOM_MAP = {
+    -1003349817033: "room2",
+    -1001467736193: "room3",
+}
 
 APP_PIN = (os.getenv("SIGNALCONVERTER_PIN") or os.getenv("APP_PIN") or "").strip() or "5487"
 SIGNALCONVERTER_LOGIN_URL = os.getenv(
@@ -191,7 +195,7 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
             json={
                 "token": current_token,
                 "text": payload.get("text"),
-                "room": payload.get("master_hint"),
+                "room": payload.get("room_hint"),
             },
             timeout=30,
         )
@@ -252,6 +256,9 @@ async def run_telethon_forever() -> None:
                     master_hint = CHAT_MASTER_MAP.get(int(chat_id))
                     if not master_hint:
                         return
+                    room_hint = CHAT_ROOM_MAP.get(int(chat_id))
+                    if not room_hint:
+                        room_hint = re.sub(r"^master_", "room", master_hint)
 
                     msg_id = event.message.id
                     key_state = str(chat_id)
@@ -272,6 +279,7 @@ async def run_telethon_forever() -> None:
                         "chat_id": chat_id,
                         "message_id": msg_id,
                         "master_hint": master_hint,
+                        "room_hint": room_hint,
                         "text": normalized,
                     }
 
