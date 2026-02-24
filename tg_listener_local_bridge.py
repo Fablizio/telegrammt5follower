@@ -133,9 +133,15 @@ def normalize_for_converter(text: str) -> str:
     t = re.sub(r"(?im)^\s*sell!+\s*$", "Sell", t)
     t = re.sub(r"(?im)^\s*buy!+\s*$", "Buy", t)
 
-    t = re.sub(r"(?im)^\s*(entry|entry\s*price|e)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"Entry: \2", t)
+    t = re.sub(r"(?im)^\s*(entry|entry\s*price|e)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"E: \2", t)
     t = re.sub(r"(?im)^\s*(tp|take\s*profit)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"TP: \2", t)
     t = re.sub(r"(?im)^\s*(sl|stop\s*loss|stop|si)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"SL: \2", t)
+
+    # Fallback: signals that use "@" to indicate the entry price
+    if re.search(r"(?im)^\s*e\s*:", t) is None:
+        m = re.search(r"(?i)@\s*([0-9][0-9\.,]*)", t)
+        if m:
+            t = f"E: {m.group(1)}\n" + t
 
     return t.strip()
 
@@ -145,7 +151,10 @@ def looks_like_signal(text: str) -> bool:
     compact = re.sub(r"\s+", " ", t).strip()
 
     has_direction = re.search(r"\b(buy|sell)(?:\s+limit)?\b", compact) is not None
-    has_entry = re.search(r"\b(entry|entry\s*price|e)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
+    has_entry = (
+        re.search(r"\b(entry|entry\s*price|e)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
+        or re.search(r"@\s*[0-9]", compact) is not None
+    )
     has_tp = re.search(r"\b(tp|take\s*profit)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
     has_sl = re.search(r"\b(sl|stop\s*loss|stop|si)\b(?:\s*[:=]\s*|\s+)[0-9]", compact) is not None
 
