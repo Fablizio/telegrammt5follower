@@ -133,9 +133,35 @@ def normalize_for_converter(text: str) -> str:
     t = re.sub(r"(?im)^\s*sell!+\s*$", "Sell", t)
     t = re.sub(r"(?im)^\s*buy!+\s*$", "Buy", t)
 
-    t = re.sub(r"(?im)^\s*(entry|entry\s*price|e)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"E: \2", t)
-    t = re.sub(r"(?im)^\s*(tp|take\s*profit)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"TP: \2", t)
-    t = re.sub(r"(?im)^\s*(sl|stop\s*loss|stop|si)\b\s*[:=]?\s*([0-9][0-9\.,]*)\s*$", r"SL: \2", t)
+    # Accept either `Entry: 1.2345` or `Entry 1.2345`, with optional trailing notes.
+    t = re.sub(r"(?im)^\s*(entry|entry\s*price|e)\b\s*[:=]?\s*([0-9][0-9\.,]*)\b.*$", r"E: \2", t)
+    t = re.sub(r"(?im)^\s*(tp|take\s*profit)\b\s*[:=]?\s*([0-9][0-9\.,]*)\b.*$", r"TP: \2", t)
+    t = re.sub(r"(?im)^\s*(sl|stop\s*loss|stop|si)\b\s*[:=]?\s*([0-9][0-9\.,]*)\b.*$", r"SL: \2", t)
+
+    # Build a canonical payload for the converter when all key fields are present,
+    # even if the original message has mixed formatting (e.g. "EUR/CHF – sell limit").
+    direction_match = re.search(r"(?i)\b(buy|sell)(?:\s+limit)?\b", t)
+    entry_match = re.search(r"(?im)^\s*e\s*:\s*([0-9][0-9\.,]*)\s*$", t)
+    tp_match = re.search(r"(?im)^\s*tp\s*:\s*([0-9][0-9\.,]*)\s*$", t)
+    sl_match = re.search(r"(?im)^\s*sl\s*:\s*([0-9][0-9\.,]*)\s*$", t)
+    pair_match = re.search(r"(?i)\b([A-Z]{3})\s*/\s*([A-Z]{3})\b", t)
+
+    if direction_match and entry_match and tp_match and sl_match:
+        direction = direction_match.group(1).capitalize()
+        entry = entry_match.group(1)
+        tp = tp_match.group(1)
+        sl = sl_match.group(1)
+
+        lines = []
+        if pair_match:
+            lines.append(f"{pair_match.group(1).upper()}{pair_match.group(2).upper()}")
+        lines.extend([
+            direction,
+            f"E: {entry}",
+            f"TP: {tp}",
+            f"SL: {sl}",
+        ])
+        t = "\n".join(lines)
 
     # Fallback: signals that use "@" to indicate the entry price
     if re.search(r"(?im)^\s*e\s*:", t) is None:
