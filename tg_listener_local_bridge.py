@@ -224,30 +224,76 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
     if not token:
         return False
 
-    async def _post(current_token: str) -> aiohttp.ClientResponse:
+    def candidate_rooms() -> list[str]:
+        seen = set()
+        out = []
+
+        def _push(value: str) -> None:
+            v = (value or "").strip()
+            if not v or v in seen:
+                return
+            seen.add(v)
+            out.append(v)
+
+        room_hint = str(payload.get("room_hint") or "")
+        master_hint = str(payload.get("master_hint") or "")
+
+        _push(room_hint)
+        _push(master_hint)
+
+        # Compatibilità con backend che usa nomi con/senza underscore.
+        m = re.match(r"^room_?(\d+)$", room_hint)
+        if m:
+            num = m.group(1)
+            _push(f"room{num}")
+            _push(f"room_{num}")
+
+        m = re.match(r"^master_?(\d+)$", master_hint)
+        if m:
+            num = m.group(1)
+            _push(f"room{num}")
+            _push(f"room_{num}")
+
+        return out
+
+    async def _post(current_token: str, room_name: str) -> aiohttp.ClientResponse:
         return await session.post(
             SIGNALCONVERTER_URL,
             json={
                 "token": current_token,
                 "text": payload.get("text"),
-                "room": payload.get("room_hint"),
+                "room": room_name,
             },
             timeout=30,
         )
 
     try:
-        resp = await _post(token)
+        rooms = candidate_rooms()
+        resp = await _post(token, rooms[0] if rooms else "")
         if resp.status == 200:
             data = await resp.json()
             if data.get("ok"):
                 return True
             log(f"[WARN] converter risposta non ok: {data}")
+        elif resp.status == 400:
+            text = await resp.text()
+            if "Pair non trovato" in text and len(rooms) > 1:
+                for alt_room in rooms[1:]:
+                    log(f"[INFO] retry converter con room={alt_room}")
+                    alt_resp = await _post(token, alt_room)
+                    if alt_resp.status != 200:
+                        continue
+                    data = await alt_resp.json()
+                    if data.get("ok"):
+                        return True
+            log(f"[WARN] converter HTTP {resp.status}: {text}")
         elif resp.status in (401, 403):
             log("[INFO] token scaduto, rinnovo")
             token = await ensure_converter_token(session, force=True)
             if not token:
                 return False
-            resp = await _post(token)
+            retry_rooms = candidate_rooms()
+            resp = await _post(token, retry_rooms[0] if retry_rooms else "")
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("ok"):
