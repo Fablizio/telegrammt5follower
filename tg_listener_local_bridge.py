@@ -32,7 +32,7 @@ CHAT_MASTER_MAP = {
 }
 CHAT_ROOM_MAP = {
     -1003349817033: "room2",
-    -1001467736193: "room3",
+    -1001467736193: "room_3",
 }
 
 APP_PIN = (os.getenv("SIGNALCONVERTER_PIN") or os.getenv("APP_PIN") or "").strip() or "5487"
@@ -145,6 +145,7 @@ def normalize_for_converter(text: str) -> str:
     tp_match = re.search(r"(?im)^\s*tp\s*:\s*([0-9][0-9\.,]*)\s*$", t)
     sl_match = re.search(r"(?im)^\s*sl\s*:\s*([0-9][0-9\.,]*)\s*$", t)
     pair_match = re.search(r"(?i)\b([A-Z]{3})\s*/\s*([A-Z]{3})\b", t)
+    symbol_match = re.search(r"(?im)^\s*([A-Z]{6})\b", t)
 
     if direction_match and entry_match and tp_match and sl_match:
         direction = direction_match.group(1).capitalize()
@@ -155,6 +156,8 @@ def normalize_for_converter(text: str) -> str:
         lines = []
         if pair_match:
             lines.append(f"{pair_match.group(1).upper()}{pair_match.group(2).upper()}")
+        elif symbol_match:
+            lines.append(symbol_match.group(1).upper())
         lines.extend([
             direction,
             f"E: {entry}",
@@ -238,21 +241,26 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
         room_hint = str(payload.get("room_hint") or "")
         master_hint = str(payload.get("master_hint") or "")
 
-        _push(room_hint)
-        _push(master_hint)
+        # Usa sempre room_* come target del converter; non inviare mai master_* come room.
+        m_room = re.match(r"^room_?(\d+)$", room_hint)
+        if m_room:
+            num = m_room.group(1)
+            prefer_underscore = "_" in room_hint
+            if prefer_underscore:
+                _push(f"room_{num}")
+                _push(f"room{num}")
+            else:
+                _push(f"room{num}")
+                _push(f"room_{num}")
+        else:
+            _push(room_hint)
 
-        # Compatibilità con backend che usa nomi con/senza underscore.
-        m = re.match(r"^room_?(\d+)$", room_hint)
-        if m:
-            num = m.group(1)
-            _push(f"room{num}")
+        # Fallback derivato da master, mantenendo room_* prima di room*.
+        m_master = re.match(r"^master_?(\d+)$", master_hint)
+        if m_master:
+            num = m_master.group(1)
             _push(f"room_{num}")
-
-        m = re.match(r"^master_?(\d+)$", master_hint)
-        if m:
-            num = m.group(1)
             _push(f"room{num}")
-            _push(f"room_{num}")
 
         return out
 
@@ -282,6 +290,8 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
                     log(f"[INFO] retry converter con room={alt_room}")
                     alt_resp = await _post(token, alt_room)
                     if alt_resp.status != 200:
+                        alt_text = await alt_resp.text()
+                        log(f"[WARN] converter retry HTTP {alt_resp.status} room={alt_room}: {alt_text}")
                         continue
                     data = await alt_resp.json()
                     if data.get("ok"):
