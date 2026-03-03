@@ -275,12 +275,24 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
 
         return out
 
-    async def _post(current_token: str, room_name: str) -> aiohttp.ClientResponse:
+    def candidate_texts() -> list[str]:
+        base_text = str(payload.get("text") or "").strip()
+        if not base_text:
+            return [""]
+
+        out = [base_text]
+        entry_variant = re.sub(r"(?im)^\s*e\s*:\s*", "Entry: ", base_text)
+        if entry_variant != base_text:
+            out.append(entry_variant)
+
+        return out
+
+    async def _post(current_token: str, room_name: str, text_to_send: str) -> aiohttp.ClientResponse:
         return await session.post(
             SIGNALCONVERTER_URL,
             json={
                 "token": current_token,
-                "text": payload.get("text"),
+                "text": text_to_send,
                 "room": room_name,
             },
             timeout=30,
@@ -288,9 +300,11 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
 
     try:
         rooms = candidate_rooms()
+        texts = candidate_texts()
         first_room = rooms[0] if rooms else ""
-        log(f"[INFO] converter send room={first_room} payload={json.dumps(payload.get('text') or '', ensure_ascii=False)}")
-        resp = await _post(token, first_room)
+        first_text = texts[0] if texts else ""
+        log(f"[INFO] converter send room={first_room} payload={json.dumps(first_text, ensure_ascii=False)}")
+        resp = await _post(token, first_room, first_text)
         if resp.status == 200:
             data = await resp.json()
             if data.get("ok"):
@@ -298,17 +312,21 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
             log(f"[WARN] converter risposta non ok: {data}")
         elif resp.status == 400:
             text = await resp.text()
-            if "Pair non trovato" in text and len(rooms) > 1:
-                for alt_room in rooms[1:]:
-                    log(f"[INFO] retry converter con room={alt_room}")
-                    alt_resp = await _post(token, alt_room)
-                    if alt_resp.status != 200:
-                        alt_text = await alt_resp.text()
-                        log(f"[WARN] converter retry HTTP {alt_resp.status} room={alt_room}: {alt_text}")
-                        continue
-                    data = await alt_resp.json()
-                    if data.get("ok"):
-                        return True
+            retry_for_400 = ("Pair non trovato" in text) or ("Entry non trovato" in text)
+            if retry_for_400 and (len(rooms) > 1 or len(texts) > 1):
+                for text_variant in texts:
+                    for alt_room in rooms:
+                        if alt_room == first_room and text_variant == first_text:
+                            continue
+                        log(f"[INFO] retry converter con room={alt_room} payload={json.dumps(text_variant, ensure_ascii=False)}")
+                        alt_resp = await _post(token, alt_room, text_variant)
+                        if alt_resp.status != 200:
+                            alt_text = await alt_resp.text()
+                            log(f"[WARN] converter retry HTTP {alt_resp.status} room={alt_room}: {alt_text}")
+                            continue
+                        data = await alt_resp.json()
+                        if data.get("ok"):
+                            return True
             log(f"[WARN] converter HTTP {resp.status}: {text}")
         elif resp.status in (401, 403):
             log("[INFO] token scaduto, rinnovo")
@@ -316,7 +334,8 @@ async def send_to_converter(session: aiohttp.ClientSession, payload: Dict[str, A
             if not token:
                 return False
             retry_rooms = candidate_rooms()
-            resp = await _post(token, retry_rooms[0] if retry_rooms else "")
+            retry_texts = candidate_texts()
+            resp = await _post(token, (retry_rooms[0] if retry_rooms else ""), (retry_texts[0] if retry_texts else ""))
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("ok"):
