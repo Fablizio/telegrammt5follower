@@ -53,6 +53,44 @@ LOCK_FILE = os.path.join(tempfile.gettempdir(), "unred_local_bridge.lock")
 _LOCK_HANDLE = None
 _converter_token: str = ""
 _token_ts: float = 0.0
+_working_login_url: str = ""
+
+
+def _candidate_login_urls() -> list[str]:
+    """Build a small ordered list of login endpoints to tolerate API path changes."""
+    raw = os.getenv("SIGNALCONVERTER_LOGIN_URLS", "") or ""
+
+    def _normalize(url: str) -> str:
+        return (url or "").strip().rstrip("/")
+
+    candidates: list[str] = []
+    seen = set()
+
+    def _push(url: str) -> None:
+        u = _normalize(url)
+        if not u or u in seen:
+            return
+        seen.add(u)
+        candidates.append(u)
+
+    for part in raw.split(","):
+        _push(part)
+
+    # Explicit primary URL remains first fallback.
+    _push(SIGNALCONVERTER_LOGIN_URL)
+
+    # Heuristics from convert endpoint.
+    base = (SIGNALCONVERTER_URL or "").strip().rstrip("/")
+    if base:
+        if "/convert-send" in base:
+            _push(base.replace("/convert-send", "/login"))
+            _push(base.replace("/convert-send", "/auth/login"))
+        if "/api/" in base:
+            root = base.split("/api/", 1)[0]
+            _push(f"{root}/api/login")
+            _push(f"{root}/api/auth/login")
+
+    return candidates
 
 
 def acquire_single_instance() -> None:
@@ -202,25 +240,42 @@ def looks_like_signal(text: str) -> bool:
 
 
 async def ensure_converter_token(session: aiohttp.ClientSession, force: bool = False) -> str:
-    global _converter_token, _token_ts
+    global _converter_token, _token_ts, _working_login_url
     if not force and _converter_token and (time.time() - _token_ts) < TOKEN_TTL:
         return _converter_token
     if not APP_PIN:
         log("[WARN] APP_PIN non impostato: impossibile autenticarsi")
         return ""
 
-    try:
-        async with session.post(
-            SIGNALCONVERTER_LOGIN_URL,
-            json={"pin": APP_PIN},
-            timeout=15,
-        ) as resp:
-            if resp.status != 200:
-                log(f"[WARN] login converter HTTP {resp.status}")
-                return ""
-            data = await resp.json()
-    except Exception as exc:
-        log(f"[WARN] login converter errore: {exc}")
+    urls = []
+    if _working_login_url:
+        urls.append(_working_login_url)
+    for candidate in _candidate_login_urls():
+        if candidate not in urls:
+            urls.append(candidate)
+
+    data: Dict[str, Any] = {}
+    for idx, login_url in enumerate(urls):
+        try:
+            async with session.post(
+                login_url,
+                json={"pin": APP_PIN},
+                timeout=15,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    short_body = (body or "").strip().replace("\n", " ")[:240]
+                    log(f"[WARN] login converter HTTP {resp.status} url={login_url} body={short_body}")
+                    continue
+                data = await resp.json()
+                _working_login_url = login_url
+                if idx > 0:
+                    log(f"[INFO] login converter fallback OK con {login_url}")
+                break
+        except Exception as exc:
+            log(f"[WARN] login converter errore url={login_url}: {exc}")
+            continue
+    else:
         return ""
 
     token = data.get("token")
