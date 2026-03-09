@@ -38,11 +38,11 @@ CHAT_ROOM_MAP = {
 APP_PIN = (os.getenv("SIGNALCONVERTER_PIN") or os.getenv("APP_PIN") or "").strip() or "5487"
 SIGNALCONVERTER_LOGIN_URL = os.getenv(
     "SIGNALCONVERTER_LOGIN_URL",
-    "https://www.unred.it/signalconverter/api/login",
+    "https://www.statium.it/signalconverter/api/login",
 )
 SIGNALCONVERTER_URL = os.getenv(
     "SIGNALCONVERTER_URL",
-    "https://www.unred.it/signalconverter/api/convert-send",
+    "https://www.statium.it/signalconverter/api/convert-send",
 )
 TOKEN_TTL = int(os.getenv("SIGNALCONVERTER_TOKEN_TTL", "540"))  # seconds
 
